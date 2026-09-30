@@ -211,6 +211,25 @@ export class AnchorAuthRequiredError extends Error {
 }
 
 /**
+ * The anchor refused the request because of what the caller asked for (an amount
+ * outside its published limits, an unsupported withdraw type), not because the
+ * anchor is unhealthy. The API maps it to `422 offramp_rejected` and it must not
+ * count towards the circuit breaker.
+ */
+export class OffRampRejectedError extends Error {
+  constructor(
+    message: string,
+    /** The anchor's published amount limits, when it named them. */
+    readonly limits: { minAmount?: number; maxAmount?: number } = {},
+    /** Withdraw types the anchor would accept, when relevant. */
+    readonly availableTypes: string[] = [],
+  ) {
+    super(message);
+    this.name = "OffRampRejectedError";
+  }
+}
+
+/**
  * The on-chain leg of a withdrawal: the seller sends `amount` of `asset` to the
  * anchor's account with this memo, signed by the seller's own wallet. Quay only
  * relays the instructions; it cannot send it, which is the point.
