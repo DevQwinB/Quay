@@ -28,7 +28,7 @@ import {
   type OffRampStateRepository,
   type PaymentLink,
   type PaymentRequest,
-  type PayoutFieldDescriptor,
+  type OfframpRequirementTypes,
   type RailPort,
   type Seller,
   type SellerRepository,
@@ -38,6 +38,7 @@ import {
   type OffRampTelemetryRow,
   type WithdrawTransfer,
 } from "@checkout/core";
+import { Sep6ValidationError } from "@checkout/offramp";
 import { canReceiveAsset, resolveAsset, type StellarConfig } from "@checkout/stellar";
 import { Horizon, Operation, Transaction, type Memo } from "@stellar/stellar-sdk";
 import { newId, newMuxedId, newReference } from "./ids";
@@ -367,6 +368,7 @@ export class LinkService {
       isDemo: body.isDemo ?? false,
     });
     metrics.linkStatusTransitionsTotal.inc({ to: link.status });
+    await this.deps.sellers.touchLastActive?.(seller.id);
 
     log.info(
       {
@@ -474,13 +476,15 @@ export class LinkService {
   }
 
   /**
-   * Returns the field descriptors for the off-ramp form, plus any payout
-   * fields the seller has already saved. Saved values are masked to the last 4
-   * chars server-side so the form can pre-fill / indicate "already on file"
-   * without ever leaking the raw bank account number to the browser (issue #32).
+   * Returns every withdrawal type the anchor offers (with each type's field
+   * descriptors) and the type to preselect, plus any payout fields the seller
+   * has already saved. Saved values are masked to the last 4 chars
+   * server-side so the form can pre-fill / indicate "already on file" without
+   * ever leaking the raw bank account number to the browser (issues #32, 5.24).
    */
   async getOfframpRequirements(linkId: string): Promise<{
-    descriptors: PayoutFieldDescriptor[];
+    types: OfframpRequirementTypes["types"];
+    defaultType: string | null;
     savedFields: Record<string, string> | null;
   }> {
     const link = await this.deps.links.findById(linkId);
@@ -489,9 +493,9 @@ export class LinkService {
     const seller = await this.deps.sellers.findById(link.sellerId);
     if (!seller) throw new HttpError(404, "seller_not_found");
 
-    let descriptors: PayoutFieldDescriptor[];
+    let requirements: OfframpRequirementTypes;
     try {
-      descriptors = await this.deps.offramp.offrampRequirements(link.asset.code, customerOf(seller));
+      requirements = await this.deps.offramp.offrampRequirements(link.asset.code, customerOf(seller));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new HttpError(502, `Off-ramp requirements error: ${message}`);
@@ -506,7 +510,7 @@ export class LinkService {
         )
       : null;
 
-    return { descriptors, savedFields };
+    return { types: requirements.types, defaultType: requirements.defaultType, savedFields };
   }
 
   /**
@@ -835,7 +839,12 @@ export class LinkService {
    * actually committing, but nothing state-changing happens here: no quote
    * is initiated, no job is created, the link is left untouched.
    */
-  async quoteCashOut(linkId: string, targetCurrency: string, opts: ServiceCallOptions = {}): Promise<OffRampQuote> {
+  async quoteCashOut(
+    linkId: string,
+    targetCurrency: string,
+    withdrawType?: string,
+    opts: ServiceCallOptions = {},
+  ): Promise<OffRampQuote> {
     const log = (opts.logger ?? this.deps.logger!);
     const link = await this.deps.links.findById(linkId);
     if (!link) throw new HttpError(404, "Link not found");
@@ -853,11 +862,12 @@ export class LinkService {
     const sourceAmount = link.paidAmount ?? link.amount;
     try {
       return await this.deps.offramp.quote(
-        { linkId: link.id, sourceAsset: link.asset, sourceAmount, targetCurrency, customer },
+        { linkId: link.id, sourceAsset: link.asset, sourceAmount, targetCurrency, customer, withdrawType },
         { logger: log },
       );
     } catch (err) {
       if (err instanceof AnchorAuthRequiredError) throw anchorAuthRequired();
+      throwIfUnknownWithdrawType(err, withdrawType);
       if (err instanceof OffRampRejectedError) throw offRampRejected(err);
       const message = err instanceof Error ? err.message : String(err);
       throw new HttpError(502, `Off-ramp error: ${message}`);
@@ -911,6 +921,7 @@ export class LinkService {
         sourceAmount,
         targetCurrency: body.targetCurrency,
         customer,
+        withdrawType: body.withdrawType,
       }, { logger: child });
 
     let quote: OffRampQuote;
@@ -964,10 +975,11 @@ export class LinkService {
       );
       if (err instanceof HttpError) throw err;
       if (err instanceof AnchorAuthRequiredError) throw anchorAuthRequired();
-      if (err instanceof OffRampRejectedError) throw offRampRejected(err);
       if (err instanceof QuoteExpiredError) {
         throw new HttpError(409, `quote_expired: ${err.message}`);
       }
+      throwIfUnknownWithdrawType(err, body.withdrawType);
+      if (err instanceof OffRampRejectedError) throw offRampRejected(err);
       throw new HttpError(502, `Off-ramp error: ${message}`);
     }
 
@@ -1346,5 +1358,23 @@ export class HttpError extends Error {
     readonly extra?: Record<string, unknown>,
   ) {
     super(message);
+  }
+}
+
+/**
+ * A withdrawType the caller chose that the anchor does not offer is the
+ * caller's mistake, not an anchor outage: 400 with the anchor's own list, so
+ * a client can re-render the picker — never the 502 a dead anchor gets
+ * (issue 5.24). Only fires when the caller actually sent a type; the
+ * operator-default and single-type paths keep their existing behavior.
+ */
+function throwIfUnknownWithdrawType(err: unknown, requested: string | undefined): void {
+  if (
+    requested &&
+    err instanceof Sep6ValidationError &&
+    err.availableTypes.length > 0 &&
+    !err.availableTypes.includes(requested)
+  ) {
+    throw new HttpError(400, "unknown_withdraw_type", { availableTypes: err.availableTypes });
   }
 }
