@@ -6,6 +6,8 @@ import { api, CheckoutError, describeError, type AnchorAuthView, type KycView } 
 import { useAnchorConnect } from "../../lib/anchor-session";
 import { useSellerWallet } from "./SessionGate";
 import { kycPanelStage, type KycLoadState } from "../../lib/kyc-load";
+import Sep9Input from "./Sep9Input";
+import { checkSep9Value, todayIso } from "../../lib/sep9-input";
 
 function humanize(field: { name: string; description?: string }): string {
   return field.description || field.name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -52,6 +54,7 @@ export default function KycPanel({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [missing, setMissing] = useState<Set<string>>(new Set());
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [showConsent, setShowConsent] = useState(false);
   const [consentFields, setConsentFields] = useState<string[]>([]);
   const [consentAnchor, setConsentAnchor] = useState<string>("the anchor");
@@ -87,7 +90,34 @@ export default function KycPanel({
     }
   }
 
+  function setFieldError(name: string, message: string | null) {
+    setFieldErrors((prev) => {
+      if ((prev[name] ?? null) === message) return prev;
+      const next = { ...prev };
+      if (message) next[name] = message;
+      else delete next[name];
+      return next;
+    });
+  }
+
+  /** Validate the visible fields with the shared SEP-9 rules; returns true when submit may proceed. */
+  function validateAll(fields: Record<string, string>): boolean {
+    const errors: Record<string, string> = {};
+    const today = todayIso();
+    for (const [name, value] of Object.entries(fields)) {
+      const r = checkSep9Value(name, value, today);
+      if (!r.ok) errors[name] = r.reason ?? "invalid value";
+    }
+    setFieldErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      setError("Fix the highlighted fields before submitting.");
+      return false;
+    }
+    return true;
+  }
+
   async function submit(fields: Record<string, string>) {
+    if (!validateAll(fields)) return;
     setError(null);
     setMissing(new Set());
     setSubmitting(true);
@@ -274,12 +304,13 @@ export default function KycPanel({
               ))}
             </select>
           ) : (
-            <input
+            <Sep9Input
               id={`kyc-${field.name}`}
+              name={field.name}
               value={values[field.name] ?? kyc.providedFields[field.name] ?? ""}
-              onChange={(e) => setValues((v) => ({ ...v, [field.name]: e.target.value }))}
-              aria-invalid={missing.has(field.name)}
-              style={missing.has(field.name) ? { borderColor: "var(--red)" } : undefined}
+              onChange={(v) => setValues((cur) => ({ ...cur, [field.name]: v }))}
+              onValidity={setFieldError}
+              invalid={missing.has(field.name) || field.name in fieldErrors}
             />
           )}
         </div>
@@ -288,7 +319,7 @@ export default function KycPanel({
       <button
         className="btn btn--primary btn--block"
         onClick={() => submit(values)}
-        disabled={submitting}
+        disabled={submitting || Object.keys(fieldErrors).length > 0}
       >
         {submitting ? "Submitting…" : "Submit"}
       </button>
